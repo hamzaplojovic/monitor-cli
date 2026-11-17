@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# mon: control the external Dell S2722QC (brightness, volume, resolution).
+# Uses m1ddc (DDC/CI over USB-C) and displayplacer (macOS display modes).
+set -euo pipefail
+
+DDC_UUID="5AD808C2-4063-43C6-AF7C-06CD3EA29290"   # m1ddc UUID of the Dell
+DP_ID="5AD808C2-4063-43C6-AF7C-06CD3EA29290"      # displayplacer persistent id
+MUTE_FILE="$HOME/mon-cli/.volume_before_mute"     # volume saved by 'mon mute'
+
+die() { echo "mon: $*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null || die "$1 not installed (brew install $1)"; }
+
+ddc() { m1ddc display "$DDC_UUID" "$@"; }
+
+# Read a 0-100 value. Right after a write the monitor can answer with junk
+# (seen: 28288, 48750), so retry until the answer is in range.
+ddc_get() {
+  local v i
+  for i in 1 2 3 4 5; do
+    v=$(ddc get "$1" 2>/dev/null || true)
+    [[ $v =~ ^[0-9]+$ ]] && ((v <= 100)) && { echo "$v"; return; }
+    sleep 0.2
+  done
+  die "monitor did not return a valid $1 value"
+}
+
+# Set a 0-100 DDC value: N, +N, -N
+adjust() {
+  local prop=$1 arg=$2 cur new
+  cur=$(ddc_get "$prop")
+  case $arg in
+    +*) new=$((cur + ${arg#+})) ;;
+    -*) new=$((cur - ${arg#-})) ;;
+    *[!0-9]*|'') die "expected N, +N or -N, got '$arg'" ;;
+    *)  new=$arg ;;
+  esac
+  ((new < 0)) && new=0; ((new > 100)) && new=100
+  ddc set "$prop" "$new" >/dev/null
+  echo "$prop: $cur -> $new"
+}
+
+dell_block() { displayplacer list | sed -n "/Persistent screen id: $DP_ID/,/^\$/p"; }
+
+current_res() { dell_block | awk '/^Resolution:/{print $2; exit}'; }
+
+res_list() {
+  dell_block | awk '/scaling:on/ && /hz:60/ {sub("res:","",$3); print $3}' | sort -u -t x -k1,1n
+}
+
+set_res() {
+  local want=$1 cfg
+  res_list | grep -qx "$want" || die "unsupported resolution $want (see: mon res list)"
+  # Reuse the current full config so the laptop screen and placement stay put.
+  cfg=$(displayplacer list | grep '^displayplacer ' | tail -1)
+  cfg=$(sed -E "s/(id:$DP_ID res:)[0-9]+x[0-9]+ hz:[0-9]+/\1$want hz:60/" <<<"$cfg")
+  eval "$cfg"
+  echo "resolution: $want"
+}
+
+usage() {
+  cat <<'EOF'
+mon - control the Dell S2722QC monitor from the terminal
+
+STATUS
+  mon                 Show brightness, volume and resolution.
+  mon status          Same as above.
+
+BRIGHTNESS  (0 = darkest, 100 = brightest; short form: b)
+  mon bright          Show the current brightness.
+  mon bright 50       Set brightness to exactly 50.
+  mon bright +10      Make it 10 brighter.
+  mon bright -10      Make it 10 darker.
+
+VOLUME  (monitor speakers, 0 = silent, 100 = loudest; short form: v)
+  mon vol             Show the current volume.
+  mon vol 30          Set volume to exactly 30.
+  mon vol +5          Turn it up by 5.
+  mon vol -5          Turn it down by 5.
+  mon mute            Mute the speakers (sets volume to 0, remembers the old one).
+  mon unmute          Unmute: bring back the volume from before 'mon mute'.
+
+RESOLUTION  (how big things look; short form: r)
+  mon res             Show the current resolution.
+  mon res list        List every resolution you can pick.
+  mon res 1080        Large text and icons (1920x1080).
+  mon res 1440        Medium, more room on screen (2560x1440).
+  mon res 1692        Small, most room on screen (3008x1692).
+  mon res 2304x1296   Any size from 'mon res list'.
+
+HELP
+  mon help            Show this help (also -h, --help).
+
+Values below 0 or above 100 are capped to 0 or 100.
+EOF
+}
+
+need m1ddc; need displayplacer
+
+cmd=${1:-status}; shift || true
+case $cmd in
+  status|s)
+    echo "brightness: $(ddc_get luminance)"
+    echo "volume:     $(ddc_get volume)"
+    echo "resolution: $(current_res)" ;;
+  b|bright|brightness)
+    [[ $# -eq 0 ]] && { ddc_get luminance; exit; }
+    adjust luminance "$1" ;;
+  v|vol|volume)
+    [[ $# -eq 0 ]] && { ddc_get volume; exit; }
+    adjust volume "$1" ;;
+  # The S2722QC ignores the DDC mute command, so mute = volume 0,
+  # remembering the previous volume in a file for unmute.
+  mute)
+    cur=$(ddc_get volume)
+    ((cur > 0)) && echo "$cur" > "$MUTE_FILE"
+    ddc set volume 0 >/dev/null; echo "muted (was $cur)" ;;
+  unmute)
+    prev=$(cat "$MUTE_FILE" 2>/dev/null || echo 50)
+    ddc set volume "$prev" >/dev/null; rm -f "$MUTE_FILE"; echo "unmuted (volume $prev)" ;;
+  r|res|resolution)
+    case ${1:-} in
+      '')   current_res ;;
+      list) res_list ;;
+      1080) set_res 1920x1080 ;;
+      1440) set_res 2560x1440 ;;
+      1692) set_res 3008x1692 ;;
+      *)    set_res "$1" ;;
+    esac ;;
+  -h|--help|help) usage ;;
+  *) usage; exit 1 ;;
+esac
